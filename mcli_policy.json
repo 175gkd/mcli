@@ -1,0 +1,10 @@
+{
+  "default_action": "ask",
+  "rules": {
+    "mock": {
+      "allow": ["echo", "add"],
+      "ask": ["render"],
+      "deny": ["fail"]
+    }
+  }
+}
