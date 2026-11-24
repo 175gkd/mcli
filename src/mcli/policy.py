@@ -42,18 +42,60 @@ class Policy:
     @classmethod
     def load(cls, path: Path) -> "Policy":
         """Load policy; if missing, write a template and return it."""
-        if not path.is_file():
-            try:
-                path.write_text(json.dumps(TEMPLATE, indent=2, ensure_ascii=False),
-                                encoding="utf-8")
-            except OSError:
-                pass
-            return cls(TEMPLATE)
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            data = TEMPLATE  # broken policy file -> safe defaults (ask)
+        except FileNotFoundError:
+            try:
+                with path.open("x", encoding="utf-8") as template:
+                    json.dump(TEMPLATE, template, indent=2, ensure_ascii=False)
+            except FileExistsError:
+                return cls.load(path)
+            return cls({})
+        except ValueError as exc:
+            raise ValueError(f"{path}: invalid policy JSON: {exc}") from exc
+        try:
+            cls._validate(data)
+        except ValueError as exc:
+            raise ValueError(f"{path}: {exc}") from exc
         return cls(data)
+
+    @staticmethod
+    def _validate(data: dict) -> None:
+        if not isinstance(data, dict):
+            raise ValueError("policy must be an object")
+        if set(data) - {"default_action", "rules"}:
+            raise ValueError("policy accepts only default_action and rules")
+        if data.get("default_action", ASK) not in (ALLOW, ASK, DENY):
+            raise ValueError("default_action must be allow, ask or deny")
+        rules = data.get("rules", {})
+        if not isinstance(rules, dict):
+            raise ValueError("rules must be an object")
+        for server, rule in rules.items():
+            prefix = f"rules.{server}"
+            if not isinstance(rule, dict):
+                raise ValueError(f"{prefix} must be an object")
+            if set(rule) - {ALLOW, ASK, DENY, "param_guards"}:
+                raise ValueError(f"{prefix} has an unknown rule field")
+            for action in (ALLOW, ASK, DENY):
+                patterns = rule.get(action, [])
+                if not isinstance(patterns, list) or not all(
+                    isinstance(pattern, str) for pattern in patterns
+                ):
+                    raise ValueError(f"{prefix}.{action} must be an array of strings")
+            guards = rule.get("param_guards", {})
+            if not isinstance(guards, dict):
+                raise ValueError(f"{prefix}.param_guards must be an object")
+            for tool, guard in guards.items():
+                field = f"{prefix}.param_guards.{tool}.deny_regex"
+                if not isinstance(guard, dict) or set(guard) != {"deny_regex"}:
+                    raise ValueError(f"{field} is required")
+                pattern = guard["deny_regex"]
+                if not isinstance(pattern, str) or not pattern:
+                    raise ValueError(f"{field} must be a non-empty string")
+                try:
+                    re.compile(pattern)
+                except re.error as exc:
+                    raise ValueError(f"{field}: {exc}") from exc
 
     def _server_rules(self, server: str) -> dict:
         return self.rules.get(server) or {}

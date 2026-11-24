@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from mcli.policy import ALLOW, ASK, DENY, Policy
 
 
@@ -87,8 +89,8 @@ def test_load_creates_template(tmp_path):
     assert p.default_action == "ask"
 
 
-def test_load_broken_file_falls_back(tmp_path):
+def test_load_broken_file_rejected(tmp_path):
     path = tmp_path / "mcli_policy.json"
     path.write_text("{not json")
-    p = Policy.load(path)
-    assert p.evaluate("x", "y") == ASK
+    with pytest.raises(ValueError, match="invalid policy JSON"):
+        Policy.load(path)

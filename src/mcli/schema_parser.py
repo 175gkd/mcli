@@ -136,6 +136,17 @@ def parse_tool_args(
                 f"missing required argument '{req}'; pass {hint} <value> "
                 f"(see 'mcli <server> {tool_name} --help')"
             )
+    from jsonschema import exceptions, validators
+
+    validator_class = validators.validator_for(schema)
+    try:
+        validator_class.check_schema(schema)
+        validator_class(schema).validate(args)
+    except exceptions.SchemaError as exc:
+        raise CliError(f"invalid inputSchema for {tool_name}: {exc.message}") from exc
+    except exceptions.ValidationError as exc:
+        location = ".".join(map(str, exc.absolute_path)) or "arguments"
+        raise CliError(f"{location}: {exc.message}; see {tool_name} --help") from exc
     return args
 
 

@@ -11,8 +11,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import math
 import os
 import signal
+import secrets
+from hmac import compare_digest
 import sys
 import time
 from contextlib import AsyncExitStack
@@ -23,31 +27,17 @@ from aiohttp import web
 
 from .config import ConfigError, ServerConfig, find_config_path, load_servers
 from .hitl import confirm
+from .ipc import daemon_lock, make_state_dir, state_dir
 from .policy import ASK, DENY, Policy, find_policy_path
 
 IDLE_TIMEOUT_S = float(os.environ.get("MCLI_IDLE_TIMEOUT", 30 * 60))
 CALL_TIMEOUT_S = float(os.environ.get("MCLI_CALL_TIMEOUT", 30))
 CONNECT_TIMEOUT_S = float(os.environ.get("MCLI_CONNECT_TIMEOUT", 60))
-
-
-def state_dir() -> Path:
-    if p := os.environ.get("MCLI_STATE_DIR"):
-        return Path(p)
-    if sys.platform == "win32":
-        return Path(os.environ.get("LOCALAPPDATA", Path.home())) / "mcli"
-    return Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / "mcli"
-
-
-def assets_dir() -> Path:
-    return Path(os.environ.get("MCLI_ASSETS_DIR", "/tmp/mcli_assets"))
+STOP_EVENT = web.AppKey("stop_event", asyncio.Event)
 
 
 def port_file() -> Path:
     return state_dir() / "daemon.port"
-
-
-def pid_file() -> Path:
-    return state_dir() / "daemon.pid"
 
 
 def log_file() -> Path:
@@ -69,23 +59,31 @@ class ServerWorker:
         self.task: asyncio.Task | None = None
         self.tools: list[dict] = []
         self.error: str | None = None
+        self.ready: asyncio.Future | None = None
+        self.stopping = False
 
     @property
     def connected(self) -> bool:
-        return self.task is not None and not self.task.done() and self.queue is not None
+        return (
+            self.task is not None and not self.task.done()
+            and self.ready is not None and self.ready.done()
+            and self.error is None and not self.stopping
+        )
 
     async def ensure_started(self) -> None:
-        if self.connected:
-            return
-        self.queue = asyncio.Queue()
-        self.task = asyncio.create_task(self._run(), name=f"mcp-{self.cfg.name}")
-        ready = asyncio.get_event_loop().create_future()
-        await self.queue.put(("__ready__", ready))
-        try:
-            await asyncio.wait_for(ready, CONNECT_TIMEOUT_S)
-        except (asyncio.TimeoutError, Exception):
-            self.error = self.error or "connect timeout"
-            raise
+        if self.stopping:
+            raise RuntimeError("worker is stopping")
+        if self.task is not None and self.error is not None:
+            await asyncio.shield(self.task)
+        if self.task is None or self.task.done():
+            self.queue = asyncio.Queue()
+            self.ready = asyncio.get_running_loop().create_future()
+            self.error = None
+            self.tools = []
+            self.task = asyncio.create_task(self._run(), name=f"mcp-{self.cfg.name}")
+        error = await asyncio.shield(self.ready)
+        if error:
+            raise RuntimeError(error)
 
     async def _connect(self, stack: AsyncExitStack):
         cfg = self.cfg
@@ -118,67 +116,65 @@ class ServerWorker:
     async def _run(self) -> None:
         try:
             async with AsyncExitStack() as stack:
-                try:
+                async with asyncio.timeout(CONNECT_TIMEOUT_S):
                     session = await self._connect(stack)
                     res = await session.list_tools()
-                    self.tools = [
-                        {
-                            "name": t.name,
-                            "description": t.description or "",
-                            "inputSchema": getattr(t, "input_schema", None)
-                            or getattr(t, "inputSchema", None) or {},
-                            "annotations": (
-                                t.annotations.model_dump(by_alias=True, exclude_none=True)
-                                if getattr(t, "annotations", None) else {}),
-                        }
-                        for t in res.tools
-                    ]
-                    self.error = None
-                except Exception as e:
-                    self.error = f"{type(e).__name__}: {e}"
-                    log(f"[{self.cfg.name}] connect failed: {self.error}")
-                while True:
-                    item = await self.queue.get()
-                    if item is None:
-                        return
-                    op, fut = item
-                    if op == "__ready__":
-                        if not fut.done():
-                            if self.error:
-                                fut.set_exception(RuntimeError(self.error))
-                            else:
-                                fut.set_result(True)
+                self.tools = [
+                    {
+                        "name": t.name,
+                        "description": t.description or "",
+                        "inputSchema": getattr(t, "input_schema", None)
+                        or getattr(t, "inputSchema", None) or {},
+                        "annotations": (
+                            t.annotations.model_dump(by_alias=True, exclude_none=True)
+                            if getattr(t, "annotations", None) else {}),
+                    }
+                    for t in res.tools
+                ]
+                self.ready.set_result(None)
+                while (item := await self.queue.get()) is not None:
+                    tool, arguments, timeout, future = item
+                    if future.done():
                         continue
-                    if self.error:
-                        if not fut.done():
-                            fut.set_exception(RuntimeError(self.error))
-                        continue
-                    tool, arguments, timeout = op
                     try:
-                        result = await asyncio.wait_for(
-                            session.call_tool(tool, arguments), timeout)
-                        if not fut.done():
-                            fut.set_result(result)
-                    except Exception as e:
-                        if not fut.done():
-                            fut.set_exception(e)
+                        result = await asyncio.wait_for(session.call_tool(tool, arguments), timeout)
+                    except Exception as exc:
+                        # The server may have executed the operation. Retire this
+                        # connection and let a subsequent request reconnect.
+                        self.error = str(exc) or type(exc).__name__
+                        if not future.done():
+                            future.set_exception(exc)
+                        return
+                    except asyncio.CancelledError:
+                        if not future.done():
+                            future.set_exception(RuntimeError("worker stopped during call"))
+                        raise
+                    if not future.done():
+                        future.set_result(result)
+        except Exception as exc:
+            self.error = str(exc) or type(exc).__name__
+            log(f"[{self.cfg.name}] worker failed: {self.error}")
         finally:
             self.error = self.error or "worker stopped"
+            if not self.ready.done():
+                self.ready.set_result(self.error)
+            while not self.queue.empty():
+                pending = self.queue.get_nowait()
+                if pending is not None and not pending[-1].done():
+                    pending[-1].set_exception(RuntimeError(self.error))
 
-    async def call(self, tool: str, arguments: dict, timeout: float) -> Any:
-        await self.ensure_started()
-        fut = asyncio.get_event_loop().create_future()
-        await self.queue.put(((tool, arguments, timeout), fut))
-        return await fut
+    async def call(self, tool: str, arguments: dict, timeout: float, tools: list[dict]) -> Any:
+        if not self.connected or self.tools is not tools:
+            raise RuntimeError("MCP connection changed; start a new request")
+        future = asyncio.get_running_loop().create_future()
+        self.queue.put_nowait((tool, arguments, timeout, future))
+        return await future
 
     async def stop(self) -> None:
-        if self.queue is not None:
-            await self.queue.put(None)
-        if self.task is not None:
-            try:
-                await asyncio.wait_for(self.task, 10)
-            except (asyncio.TimeoutError, Exception):
-                self.task.cancel()
+        self.stopping = True
+        if self.task is not None and not self.task.done():
+            self.task.cancel()
+            await asyncio.gather(self.task, return_exceptions=True)
 
 
 class Pool:
@@ -205,24 +201,37 @@ class Pool:
             raise RuntimeError(f"{name}: {w.error}")
         return w.tools
 
-    async def call(self, name: str, tool: str, arguments: dict, timeout: float):
+    async def call(self, name: str, tool: str, arguments: dict, timeout: float, tools: list[dict]):
         w = self.workers.get(name)
         if w is None:
             raise KeyError(name)
-        return await w.call(tool, arguments, timeout)
+        return await w.call(tool, arguments, timeout, tools)
 
     async def stop_all(self) -> None:
         await asyncio.gather(*(w.stop() for w in self.workers.values()),
                              return_exceptions=True)
 
 
-def make_app(pool: Pool, started_at: float, policy: Policy) -> web.Application:
-    last_request = {"t": time.monotonic()}
+def make_app(pool: Pool, started_at: float, policy: Policy, token: str) -> web.Application:
+    last_request = time.monotonic()
+    active_requests = 0
+
+    @web.middleware
+    async def authenticate(request, handler):
+        supplied = request.headers.get("Authorization", "").encode("utf-8")
+        if not compare_digest(supplied, f"Bearer {token}".encode()):
+            return web.json_response({"error": "daemon authentication required"}, status=401)
+        return await handler(request)
 
     @web.middleware
     async def touch(request, handler):
-        last_request["t"] = time.monotonic()
-        return await handler(request)
+        nonlocal active_requests, last_request
+        active_requests += 1
+        try:
+            return await handler(request)
+        finally:
+            active_requests -= 1
+            last_request = time.monotonic()
 
     async def health(request):
         return web.json_response({
@@ -255,9 +264,15 @@ def make_app(pool: Pool, started_at: float, policy: Policy) -> web.Application:
             body = await request.json()
         except Exception:
             return web.json_response({"error": "body must be JSON"}, status=400)
+        if not isinstance(body, dict):
+            return web.json_response({"error": "body must be a JSON object"}, status=400)
         name, tool = body.get("server"), body.get("tool")
-        arguments = body.get("arguments") or {}
-        timeout = float(body.get("timeout") or CALL_TIMEOUT_S)
+        arguments = body.get("arguments", {})
+        timeout = body.get("timeout", CALL_TIMEOUT_S)
+        if not isinstance(name, str) or not isinstance(tool, str) or not isinstance(arguments, dict):
+            return web.json_response({"error": "expected server, tool and an arguments object"}, status=400)
+        if type(timeout) not in (int, float) or not 0 < timeout < math.inf:
+            return web.json_response({"error": "timeout must be a positive finite number"}, status=400)
         if name not in pool.workers:
             return web.json_response({"error": f"unknown server '{name}'"}, status=404)
 
@@ -287,7 +302,7 @@ def make_app(pool: Pool, started_at: float, policy: Policy) -> web.Application:
                 }, status=403)
 
         try:
-            result = await pool.call(name, tool, arguments, timeout)
+            result = await pool.call(name, tool, arguments, timeout, tools)
         except asyncio.TimeoutError:
             return web.json_response(
                 {"error": f"tool call timed out after {timeout}s"}, status=504)
@@ -297,11 +312,11 @@ def make_app(pool: Pool, started_at: float, policy: Policy) -> web.Application:
             {"result": result.model_dump(mode="json", by_alias=True)})
 
     async def shutdown(request):
-        asyncio.get_event_loop().call_later(0.2, request.app["stop_event"].set)
+        asyncio.get_event_loop().call_later(0.2, request.app[STOP_EVENT].set)
         return web.json_response({"status": "stopping"})
 
-    app = web.Application(middlewares=[touch])
-    app["stop_event"] = asyncio.Event()
+    app = web.Application(middlewares=[authenticate, touch])
+    app[STOP_EVENT] = asyncio.Event()
     app.router.add_get("/health", health)
     app.router.add_get("/servers", servers)
     app.router.add_get("/servers/{server}/tools", tools_of)
@@ -311,15 +326,18 @@ def make_app(pool: Pool, started_at: float, policy: Policy) -> web.Application:
     async def idle_watchdog():
         while True:
             await asyncio.sleep(30)
-            if time.monotonic() - last_request["t"] > IDLE_TIMEOUT_S:
+            if not active_requests and time.monotonic() - last_request > IDLE_TIMEOUT_S:
                 log("idle timeout reached, shutting down")
-                app["stop_event"].set()
+                app[STOP_EVENT].set()
                 return
 
-    async def start_idle_watchdog(app):
-        app["_idle"] = asyncio.create_task(idle_watchdog())
+    async def manage_idle_watchdog(app):
+        task = asyncio.create_task(idle_watchdog())
+        yield
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
-    app.on_startup.append(start_idle_watchdog)
+    app.cleanup_ctx.append(manage_idle_watchdog)
     return app
 
 
@@ -332,9 +350,14 @@ async def amain() -> int:
         print(f"mcli-daemon: {e}", file=sys.stderr)
         return 2
 
-    policy = Policy.load(find_policy_path(cfg_path))
+    try:
+        policy = Policy.load(find_policy_path(cfg_path))
+    except (OSError, ValueError) as exc:
+        log(f"policy error: {exc}")
+        return 2
+    token = secrets.token_urlsafe(32)
     pool = Pool(servers)
-    app = make_app(pool, time.monotonic(), policy)
+    app = make_app(pool, time.monotonic(), policy, token)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", 0)
@@ -345,32 +368,38 @@ async def amain() -> int:
         return 2
 
     state_dir().mkdir(parents=True, exist_ok=True)
-    port_file().write_text(str(port))
-    pid_file().write_text(str(os.getpid()))
+    metadata = port_file().with_suffix(".tmp")
+    metadata.write_text(json.dumps({"port": port, "token": token}), encoding="utf-8")
+    metadata.replace(port_file())
     log(f"daemon up on 127.0.0.1:{port} pid={os.getpid()}")
 
     loop = asyncio.get_event_loop()
     for sig in (getattr(signal, "SIGINT", None), getattr(signal, "SIGTERM", None)):
         if sig is not None:
             try:
-                loop.add_signal_handler(sig, app["stop_event"].set)
+                loop.add_signal_handler(sig, app[STOP_EVENT].set)
             except (NotImplementedError, RuntimeError):
                 pass
 
-    await app["stop_event"].wait()
-    log("shutting down")
-    await pool.stop_all()
-    await runner.cleanup()
-    for f in (port_file(), pid_file()):
-        try:
-            f.unlink()
-        except OSError:
-            pass
+    try:
+        await app[STOP_EVENT].wait()
+    finally:
+        log("shutting down")
+        await site.stop()
+        await pool.stop_all()
+        await runner.cleanup()
+        port_file().unlink(missing_ok=True)
     return 0
 
 
 def main() -> None:
-    sys.exit(asyncio.run(amain()))
+    logging.basicConfig(level=logging.INFO)
+    try:
+        with daemon_lock(make_state_dir() / "daemon.lock") as acquired:
+            if acquired:
+                sys.exit(asyncio.run(amain()))
+    except (ConfigError, OSError) as exc:
+        sys.exit(f"mcli-daemon: {exc}")
 
 
 if __name__ == "__main__":

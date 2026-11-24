@@ -7,7 +7,9 @@ dialog tooling, or headless environments all safely default to False.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
+import logging
 import os
 import platform
 import shutil
@@ -15,6 +17,7 @@ import subprocess
 
 CONFIRM_TIMEOUT_S = float(os.environ.get("MCLI_CONFIRM_TIMEOUT", 60))
 _PREVIEW_LIMIT = 300
+logger = logging.getLogger(__name__)
 
 
 def _preview(server: str, tool: str, arguments: dict) -> str:
@@ -41,25 +44,36 @@ def confirm_sync(server: str, tool: str, arguments: dict) -> bool:
             return _confirm_macos(msg)
         if system == "Linux":
             return _confirm_linux(msg)
-    except Exception:
+    except subprocess.TimeoutExpired:
+        logger.warning("Approval timed out for %s.%s", server, tool)
         return False
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("Approval dialog failed for %s.%s (%s)", server, tool, type(exc).__name__)
+        return False
+    logger.warning("Approval dialogs are unavailable on %s", system)
     return False
 
 
 def _confirm_windows(msg: str) -> bool:
-    ps_msg = msg.replace("'", "''")
+    encoded = base64.b64encode(msg.encode("utf-8")).decode("ascii")
     script = (
+        "$ErrorActionPreference = 'Stop'; "
         "Add-Type -AssemblyName PresentationFramework; "
+        f"$msg = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{encoded}')); "
         "$r = [System.Windows.MessageBox]::Show("
-        f"'{ps_msg}', 'mcli permission', "
+        "$msg, 'mcli permission', "
         "[System.Windows.MessageBoxButton]::YesNo, "
         "[System.Windows.MessageBoxImage]::Warning, "
         "[System.Windows.MessageBoxResult]::No); "
-        "if ($r -eq 'Yes') { exit 0 } else { exit 1 }"
+        "if ($r -eq 'Yes') { exit 0 } else { exit 3 }"
     )
     r = subprocess.run(
-        ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+        ["powershell", "-NoProfile", "-NonInteractive", "-STA", "-Command", script],
         timeout=CONFIRM_TIMEOUT_S, capture_output=True)
+    if r.returncode == 3:
+        logger.info("Windows approval denied")
+    elif r.returncode != 0:
+        logger.warning("Windows approval dialog failed (exit %s)", r.returncode)
     return r.returncode == 0
 
 
@@ -71,19 +85,31 @@ def _confirm_macos(msg: str) -> bool:
     )
     r = subprocess.run(["osascript", "-e", script],
                        timeout=CONFIRM_TIMEOUT_S, capture_output=True, text=True)
-    return r.returncode == 0 and "Allow" in (r.stdout or "")
+    if r.returncode != 0:
+        logger.warning("macOS approval dialog failed (exit %s)", r.returncode)
+        return False
+    approved = r.stdout.strip() == "button returned:Allow"
+    if not approved:
+        logger.info("macOS approval denied")
+    return approved
 
 
 def _confirm_linux(msg: str) -> bool:
     if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        logger.warning("Linux approval unavailable: no display")
         return False
     zenity = shutil.which("zenity")
     if not zenity:
+        logger.warning("Linux approval unavailable: zenity missing")
         return False
     r = subprocess.run(
         [zenity, "--question", "--title=mcli permission",
          f"--text={msg}", "--default-cancel"],
         timeout=CONFIRM_TIMEOUT_S, capture_output=True)
+    if r.returncode == 1 and not r.stderr:
+        logger.info("Linux approval denied")
+    elif r.returncode != 0:
+        logger.warning("Linux approval dialog failed (exit %s)", r.returncode)
     return r.returncode == 0
 
 

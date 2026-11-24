@@ -12,6 +12,8 @@ import tempfile
 import time
 from pathlib import Path
 
+from .config import ConfigError
+from .ipc import daemon_lock, make_state_dir, state_dir
 from .schema_parser import (
     CliError,
     parse_tool_args,
@@ -23,20 +25,8 @@ CLIENT_TIMEOUT_S = float(os.environ.get("MCLI_CLIENT_TIMEOUT", 120))
 SPAWN_WAIT_S = float(os.environ.get("MCLI_SPAWN_WAIT", 20))
 
 
-def state_dir() -> Path:
-    if p := os.environ.get("MCLI_STATE_DIR"):
-        return Path(p)
-    if sys.platform == "win32":
-        return Path(os.environ.get("LOCALAPPDATA", Path.home())) / "mcli"
-    return Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / "mcli"
-
-
 def port_file() -> Path:
     return state_dir() / "daemon.port"
-
-
-def pid_file() -> Path:
-    return state_dir() / "daemon.pid"
 
 
 def log_file() -> Path:
@@ -63,15 +53,17 @@ def fail(msg: str, code: int = 1) -> "SystemExit":
 
 
 class DaemonClient:
-    def __init__(self, port: int):
+    def __init__(self, port: int, token: str):
         self.port = port
+        self.token = token
 
     def request(self, method: str, path: str, body=None, timeout=CLIENT_TIMEOUT_S) -> dict:
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=timeout)
         try:
             conn.request(method, path,
                          body=json.dumps(body) if body is not None else None,
-                         headers={"Content-Type": "application/json"})
+                         headers={"Content-Type": "application/json",
+                                  "Authorization": f"Bearer {self.token}"})
             resp = conn.getresponse()
             data = resp.read()
         except (OSError, http.client.HTTPException) as e:
@@ -90,28 +82,19 @@ class DaemonClient:
         return payload
 
 
-def _read_port() -> int | None:
+def _daemon_alive() -> DaemonClient | None:
     try:
-        return int(port_file().read_text().strip())
-    except (OSError, ValueError):
+        metadata = json.loads(port_file().read_text(encoding="utf-8"))
+        client = DaemonClient(metadata["port"], metadata["token"])
+        client.request("GET", "/health", timeout=2)
+        return client
+    except (CliError, OSError, ValueError, TypeError, KeyError):
         return None
 
 
-def _daemon_alive() -> int | None:
-    port = _read_port()
-    if port is None:
-        return None
-    try:
-        DaemonClient(port).request("GET", "/health", timeout=2)
-        return port
-    except CliError:
-        return None
-
-
-def _spawn_daemon() -> None:
-    state_dir().mkdir(parents=True, exist_ok=True)
-    logf = open(log_file(), "ab")
-    kwargs: dict = dict(stdout=logf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+def _spawn_daemon() -> subprocess.Popen:
+    make_state_dir()
+    kwargs: dict = dict(stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
     if sys.platform == "win32":
         kwargs["creationflags"] = (
             subprocess.CREATE_NEW_PROCESS_GROUP
@@ -120,30 +103,23 @@ def _spawn_daemon() -> None:
         )
     else:
         kwargs["start_new_session"] = True
-    subprocess.Popen([sys.executable, "-m", "mcli.daemon"], **kwargs)
-    logf.close()
+    with open(log_file(), "ab") as logf:
+        return subprocess.Popen([sys.executable, "-m", "mcli.daemon"], stdout=logf, **kwargs)
 
 
 def ensure_daemon() -> DaemonClient:
-    port = _daemon_alive()
-    if port is not None:
-        return DaemonClient(port)
-    _spawn_daemon()
+    if client := _daemon_alive():
+        return client
+    process = _spawn_daemon()
     deadline = time.monotonic() + SPAWN_WAIT_S
     while time.monotonic() < deadline:
-        port = _daemon_alive()
-        if port is not None:
-            return DaemonClient(port)
+        if client := _daemon_alive():
+            return client
+        if process.poll() not in (None, 0):
+            raise CliError(f"daemon failed to start; check {log_file()}")
         time.sleep(0.25)
     raise CliError(
         f"daemon did not become ready in {SPAWN_WAIT_S}s; check {log_file()}")
-
-
-def _daemon_pid() -> int | None:
-    try:
-        return int(pid_file().read_text().strip())
-    except (OSError, ValueError):
-        return None
 
 
 def usage() -> str:
@@ -163,41 +139,30 @@ def cmd_daemon(action: str) -> int:
         if _daemon_alive():
             eprint("mcli-daemon already running")
             return 0
-        _spawn_daemon()
-        for _ in range(int(SPAWN_WAIT_S / 0.25)):
-            if _daemon_alive():
-                print("mcli-daemon started")
-                return 0
-            time.sleep(0.25)
-        raise CliError(f"daemon failed to start; check {log_file()}")
+        ensure_daemon()
+        print("mcli-daemon started")
+        return 0
     if action == "stop":
-        port = _daemon_alive()
-        if port is None:
+        client = _daemon_alive()
+        if client is None:
             print("mcli-daemon is not running")
             return 0
-        try:
-            DaemonClient(port).request("POST", "/shutdown", body={}, timeout=5)
-        except CliError:
-            pass
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline and _daemon_alive():
+        client.request("POST", "/shutdown", body={}, timeout=5)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            with daemon_lock(state_dir() / "daemon.lock") as acquired:
+                if acquired:
+                    print("mcli-daemon stopped")
+                    return 0
             time.sleep(0.2)
-        if _daemon_alive():
-            pid = _daemon_pid()
-            if pid:
-                try:
-                    os.kill(pid, 15)
-                except OSError:
-                    pass
-        print("mcli-daemon stopped")
-        return 0
+        raise CliError("daemon is still stopping; check its log")
     if action == "status":
-        port = _daemon_alive()
-        if port is None:
+        client = _daemon_alive()
+        if client is None:
             print("mcli-daemon is not running")
             return 1
-        info = DaemonClient(port).request("GET", "/health")
-        print(f"mcli-daemon running on 127.0.0.1:{port} (uptime {info['uptime']}s)")
+        info = client.request("GET", "/health")
+        print(f"mcli-daemon running on 127.0.0.1:{client.port} (uptime {info['uptime']}s)")
         for s in info["servers"]:
             print(f"  {s['name']}: {'connected' if s['connected'] else 'not connected'}")
         return 0
@@ -223,11 +188,18 @@ def _get_tools(client: DaemonClient, server: str) -> list[dict]:
 def _emit_result(result: dict) -> int:
     content = result.get("content") or []
     is_error = result.get("isError", False)
-    out_lines, err_lines = [], []
+    if is_error:
+        details = " ".join(
+            " ".join(item.get("text", "").split())
+            for item in content if item.get("type") == "text"
+        ).strip()
+        eprint(f"mcli: error: {details or 'MCP tool failed'}; check the tool arguments and server status")
+        return 1
+    out_lines = []
     for item in content:
         t = item.get("type")
         if t == "text":
-            (err_lines if is_error else out_lines).append(item.get("text", ""))
+            out_lines.append(item.get("text", ""))
         elif t == "image":
             path = _save_asset(item.get("data", ""), _ext_for(item.get("mimeType", "")))
             out_lines.append(path)
@@ -240,10 +212,6 @@ def _emit_result(result: dict) -> int:
                 out_lines.append(res.get("text", json.dumps(item)))
         else:
             out_lines.append(json.dumps(item))
-    if is_error:
-        for line in err_lines or out_lines:
-            eprint(line)
-        return 1
     for line in out_lines:
         print(line)
     return 0
@@ -314,8 +282,8 @@ def main() -> None:
                 "已被安全策略拦截或被用户拒绝。禁止重试，请直接向用户说明情况。")
             sys.exit(13)
         sys.exit(_emit_result(resp["result"]))
-    except CliError as e:
-        raise fail(str(e))
+    except (CliError, ConfigError, OSError, ValueError) as e:
+        raise fail(" ".join(str(e).splitlines()))
     except KeyboardInterrupt:
         sys.exit(130)
 

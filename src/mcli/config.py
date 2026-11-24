@@ -39,6 +39,11 @@ def default_config_candidates() -> list[Path]:
 
 
 def find_config_path() -> Path:
+    if explicit := os.environ.get("MCLI_CONFIG"):
+        path = Path(explicit)
+        if not path.is_file():
+            raise ConfigError(f"MCLI_CONFIG does not point to a file: {path}")
+        return path
     for p in default_config_candidates():
         if p.is_file():
             return p
