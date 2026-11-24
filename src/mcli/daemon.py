@@ -26,7 +26,7 @@ from typing import Any
 from aiohttp import web
 
 from .config import ConfigError, ServerConfig, find_config_path, load_servers
-from .hitl import confirm
+from .hitl import Approval, confirm
 from .ipc import daemon_lock, make_state_dir, state_dir
 from .policy import ASK, DENY, Policy, find_policy_path
 
@@ -291,14 +291,21 @@ def make_app(pool: Pool, started_at: float, policy: Policy, token: str) -> web.A
         if decision == DENY:
             return web.json_response({
                 "code": "PERMISSION_DENIED",
+                "reason": "policy_denied",
                 "error": f"tool '{name}.{tool}' denied by security policy",
             }, status=403)
         if decision == ASK:
-            ok = await confirm(name, tool, arguments)
-            if not ok:
+            approval = await confirm(name, tool, arguments)
+            if approval is not Approval.APPROVED:
+                detail = {
+                    Approval.DENIED: "rejected by user",
+                    Approval.TIMED_OUT: "approval timed out",
+                    Approval.UNAVAILABLE: "approval dialog unavailable",
+                }[approval]
                 return web.json_response({
                     "code": "PERMISSION_DENIED",
-                    "error": f"tool '{name}.{tool}' rejected by user or timed out",
+                    "reason": approval.value,
+                    "error": f"tool '{name}.{tool}': {detail}",
                 }, status=403)
 
         try:

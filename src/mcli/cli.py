@@ -276,10 +276,9 @@ def main() -> None:
         try:
             resp = client.request("POST", "/call", body={
                 "server": server, "tool": tool, "arguments": arguments})
-        except PermissionDenied:
-            eprint(
-                f"[PERMISSION_DENIED] 工具 {server}.{tool} "
-                "已被安全策略拦截或被用户拒绝。禁止重试，请直接向用户说明情况。")
+        except PermissionDenied as e:
+            detail = " ".join(str(e).splitlines())
+            eprint(f"[PERMISSION_DENIED] {detail}")
             sys.exit(13)
         sys.exit(_emit_result(resp["result"]))
     except (CliError, ConfigError, OSError, ValueError) as e:

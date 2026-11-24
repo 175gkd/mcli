@@ -14,6 +14,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from mcli.cli import DaemonClient, _emit_result, state_dir
 from mcli.config import ServerConfig
 from mcli.daemon import ServerWorker, make_app
+from mcli import hitl
 from mcli.policy import Policy
 from mcli.schema_parser import CliError, parse_tool_args
 
@@ -159,6 +160,7 @@ def test_cli_and_local_daemon(tmp_path):
         denied = cli("mock", "echo", "--text", "test")
         assert (denied.returncode, denied.stdout) == (13, "")
         assert denied.stderr.startswith("[PERMISSION_DENIED]")
+        assert "denied by security policy" in denied.stderr
         failure = cli("mock", "fail", "--msg", "first\nsecond")
         assert (failure.returncode, failure.stdout) == (1, "")
         assert failure.stderr.count("\n") == 1
@@ -171,15 +173,20 @@ def test_cli_and_local_daemon(tmp_path):
         assert stopped.returncode == 0, stopped.stderr
 
 
-@pytest.mark.parametrize("approved", [True, False])
-def test_ask_reaches_mcp_only_with_approval(monkeypatch, approved):
+@pytest.mark.parametrize("outcome, reason", [
+    ("APPROVED", None),
+    ("DENIED", "user_denied"),
+    ("TIMED_OUT", "approval_timeout"),
+    ("UNAVAILABLE", "approval_unavailable"),
+])
+def test_each_ask_reaches_mcp_only_with_its_own_approval(monkeypatch, outcome, reason):
     async def run():
         invocations = []
         tools = [{"name": "change"}]
 
         async def confirm(server, tool, arguments):
             invocations.append(("confirm", server, tool, arguments))
-            return approved
+            return getattr(hitl.Approval, outcome)
 
         async def ensure_tools(server):
             return tools
@@ -190,20 +197,27 @@ def test_ask_reaches_mcp_only_with_approval(monkeypatch, approved):
             return SimpleNamespace(model_dump=lambda **_: {"content": []})
 
         monkeypatch.setattr("mcli.daemon.confirm", confirm)
-        pool = SimpleNamespace(workers={"mock": object()}, ensure_tools=ensure_tools, call=call)
+        pool = SimpleNamespace(
+            workers={"first": object(), "second": object()}, ensure_tools=ensure_tools, call=call,
+        )
         app = make_app(pool, 0, Policy({}), "test-token")
         arguments = {"value": "x"}
+        expected = []
         async with TestClient(TestServer(app)) as client:
-            response = await client.post(
-                "/call", headers={"Authorization": "Bearer test-token"},
-                json={"server": "mock", "tool": "change", "arguments": arguments},
-            )
-            assert response.status == (200 if approved else 403)
-            if not approved:
-                assert (await response.json())["code"] == "PERMISSION_DENIED"
-        expected = [("confirm", "mock", "change", arguments)]
-        if approved:
-            expected.append(("call", "mock", "change", arguments))
+            for server in ("first", "first", "second"):
+                response = await client.post(
+                    "/call", headers={"Authorization": "Bearer test-token"},
+                    json={"server": server, "tool": "change", "arguments": arguments},
+                )
+                expected.append(("confirm", server, "change", arguments))
+                if reason is None:
+                    assert response.status == 200
+                    expected.append(("call", server, "change", arguments))
+                else:
+                    assert response.status == 403
+                    payload = await response.json()
+                    assert payload["code"] == "PERMISSION_DENIED"
+                    assert payload["reason"] == reason
         assert invocations == expected
 
     asyncio.run(run())

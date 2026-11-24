@@ -99,7 +99,7 @@ printf '%s\n' '{"a": 2, "b": 3}' | uv run mcli mock add --stdin
 判定依次检查 `param_guards` 的 `deny_regex`、工具名通配符规则、MCP 工具注解和全局 `default_action`。同一工具同时命中多条显式规则时，优先级为 `deny` → `ask` → `allow`。注解兜底先检查 `destructiveHint` 并要求审批，再检查 `readOnlyHint` 并放行。
 
 - `uv run mcli mock add --a 2 --b 3` 直接执行。
-- `uv run mcli mock render --mode svg` 请求桌面审批。Windows 使用 PowerShell 弹窗，macOS 使用 `osascript`，Linux 需要图形会话和 `zenity`。默认等待 60 秒，超时或弹窗不可用时拒绝。
+- 每次判定为 `ask` 的调用都单独请求桌面审批，例如 `uv run mcli mock render --mode svg`。Windows 在 daemon 所在的交互桌面显示原生置顶弹窗，macOS 使用 `osascript`，Linux 需要图形会话和 `zenity`。默认等待 60 秒。CLI 会区分策略拒绝、用户拒绝、审批超时和弹窗不可用，这些结果均返回 `[PERMISSION_DENIED]` 和退出码 `13`。
 - `uv run mcli mock fail --msg demo` 被策略拒绝，stderr 包含 `[PERMISSION_DENIED]`，退出码为 `13`。Bash 可用 `echo $?` 查看，PowerShell 可读取 `$LASTEXITCODE`。
 
 ## 给 AI Agent 使用
